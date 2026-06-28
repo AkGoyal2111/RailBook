@@ -8,6 +8,7 @@ const cookieParser = require('cookie-parser');
 const stationRoutes = require('./routes/station.route');
 const trainRoutes = require('./routes/train.route');
 const scheduleRoutes = require('./routes/schedule.route');
+const searchRoutes = require('./routes/search.route');
 
 // Middlewares
 const { corsMiddleware } = require('./middlewares/cors.middleware');
@@ -53,6 +54,7 @@ app.get('/health', (req, res) => {
 app.use("/stations", stationRoutes);
 app.use("/trains", trainRoutes);
 app.use("/schedules", scheduleRoutes);
+app.use("/search", searchRoutes);
 
 // Error handler (must be last)
 app.use(errorHandler);
