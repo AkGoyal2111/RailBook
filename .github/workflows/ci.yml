@@ -1,0 +1,40 @@
+name: CI
+
+# Run on every push to main and on every pull request targeting main.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test ${{ matrix.service }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Don't cancel the other services if one fails — we want to see all results.
+      fail-fast: false
+      matrix:
+        service: [api-gateway, payment-service, user-service]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ matrix.service }}/package-lock.json
+
+      # --ignore-scripts skips Prisma's postinstall (client generation) — the unit
+      # tests don't touch the database, so we keep CI fast and free of a DB dependency.
+      - name: Install dependencies
+        working-directory: ${{ matrix.service }}
+        run: npm ci --ignore-scripts
+
+      - name: Run tests
+        working-directory: ${{ matrix.service }}
+        run: npm test
