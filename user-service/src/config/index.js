@@ -5,8 +5,6 @@ const config = {
   LOG_LEVEL: process.env.LOG_LEVEL || "info",
   DATABASE_URL: process.env.DATABASE_URL,
   REDIS_URL: process.env.REDIS_URL,
-  KAFKA_BROKER: process.env.KAFKA_BROKER,
-  KAFKA_CLIENT_ID: process.env.KAFKA_CLIENT_ID,
   ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
 
   OTP_TTL: process.env.OTP_TTL || 300,
@@ -23,8 +21,10 @@ const config = {
   REDIS_USER_TTL: Number(process.env.REDIS_USER_TTL || 86400),
 
 
-  MAIL_SEND: process.env.MAIL_SEND,
-  SENDGRID_API_KEY: process.env.SENDGRID_API_KEY,
+  // Gmail SMTP (used directly for OTP emails — no separate notification service)
+  GMAIL_USER: process.env.GMAIL_USER,
+  GMAIL_APP_PASSWORD: process.env.GMAIL_APP_PASSWORD,
+  MAIL_FROM: process.env.MAIL_FROM,
 
   GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
@@ -37,11 +37,11 @@ if (!config.GOOGLE_CLIENT_ID) {
   throw new Error("GOOGLE_CLIENT_ID environment variable is required");
 }
 
-if (!config.SENDGRID_API_KEY) {
-  throw new Error('SENDGRID_API_KEY missing');
+if (!config.GMAIL_USER) {
+  throw new Error('GMAIL_USER missing');
 }
 
-if (!config.MAIL_SEND) {
-  throw new Error('MAIL_SEND missing');
+if (!config.GMAIL_APP_PASSWORD) {
+  throw new Error('GMAIL_APP_PASSWORD missing');
 }
 module.exports = { config };

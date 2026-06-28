@@ -5,7 +5,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",
@@ -14,7 +15,6 @@
   "dependencies": {
     "@prisma/adapter-pg": "^7.2.0",
     "@prisma/client": "^7.2.0",
-    "@sendgrid/mail": "^8.1.6",
     "bcrypt": "^6.0.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
@@ -25,7 +25,7 @@
     "helmet": "^8.1.0",
     "ioredis": "^5.9.1",
     "jsonwebtoken": "^9.0.3",
-    "kafkajs": "^2.2.4",
+    "nodemailer": "^6.10.1",
     "otp-generator": "^4.0.1",
     "pg": "^8.17.1",
     "winston": "^3.19.0"
