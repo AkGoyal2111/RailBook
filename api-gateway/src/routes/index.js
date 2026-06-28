@@ -57,20 +57,6 @@ router.get(
      userServiceProxy
 )
 
-router.put(
-     '/users/user/profile',
-     requireAuth,
-     combinedRateLimit(),
-     userServiceProxy
-)
-
-router.delete(
-     '/users/user/profile',
-     requireAuth,
-     combinedRateLimit(),
-     userServiceProxy
-)
-
 const adminServiceProxy = createProxy('adminService', config.SERVICES.ADMIN_SERVICE_URL);
 
 router.post(
@@ -122,9 +108,12 @@ router.put(
      adminServiceProxy
 )
 // ===========================
-// SEARCH SERVICE ROUTES (public - no auth required)
+// SEARCH ROUTES (public - no auth required)
+// Served by admin-service (PostgreSQL-backed) under its /search prefix.
+// preservePath keeps the full /search/* path so it doesn't collide with
+// admin-service's /trains routes.
 // ===========================
-const searchServiceProxy = createProxy('searchService', config.SERVICES.SEARCH_SERVICE_URL);
+const searchServiceProxy = createProxy('searchService', config.SERVICES.ADMIN_SERVICE_URL, { preservePath: true });
 
 router.get(
      '/search/trains',
