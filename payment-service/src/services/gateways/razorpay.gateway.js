@@ -1,7 +1,7 @@
 const Razorpay = require('razorpay');
-const crypto = require('crypto');
 const BaseGateway = require('./base.gateway');
 const logger = require('../../config/logger');
+const { verifyPaymentSignature, verifyWebhookSignature } = require('./signature');
 
 class RazorpayGateway extends BaseGateway {
      constructor(keyId, keySecret, webhookSecret) {
@@ -46,44 +46,11 @@ class RazorpayGateway extends BaseGateway {
      }
 
      verifyPaymentSignature(orderId, paymentId, signature) {
-          const body = `${orderId}|${paymentId}`;
-          const expectedSignature = crypto
-               .createHmac('sha256', this.keySecret)
-               .update(body)
-               .digest('hex');
-
-          return crypto.timingSafeEqual(
-               Buffer.from(expectedSignature, 'hex'),
-               Buffer.from(signature, 'hex')
-          );
+          return verifyPaymentSignature(this.keySecret, orderId, paymentId, signature);
      }
 
      verifyWebhookSignature(rawBody, signature) {
-          const body = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
-          const expectedSignature = crypto
-               .createHmac('sha256', this.webhookSecret)
-               .update(body)
-               .digest('hex');
-
-          try {
-               return crypto.timingSafeEqual(
-                    Buffer.from(expectedSignature, 'hex'),
-                    Buffer.from(signature, 'hex')
-               );
-          } catch {
-               return false;
-          }
-     }
-
-     async fetchPayment(paymentId) {
-          const payment = await this.client.payments.fetch(paymentId);
-
-          return {
-               status: payment.status,
-               amount: payment.amount / 100,
-               method: payment.method,
-               rawResponse: payment,
-          };
+          return verifyWebhookSignature(this.webhookSecret, rawBody, signature);
      }
 
      async initiateRefund(paymentId, amount, notes = {}) {
@@ -98,16 +65,6 @@ class RazorpayGateway extends BaseGateway {
 
           return {
                gatewayRefundId: refund.id,
-               status: refund.status,
-               amount: refund.amount / 100,
-               rawResponse: refund,
-          };
-     }
-
-     async fetchRefund(paymentId, refundId) {
-          const refund = await this.client.payments.fetchRefund(paymentId, refundId);
-
-          return {
                status: refund.status,
                amount: refund.amount / 100,
                rawResponse: refund,

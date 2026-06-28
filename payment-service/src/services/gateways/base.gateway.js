@@ -45,15 +45,6 @@ class BaseGateway {
      }
 
      /**
-      * Fetch payment details from gateway.
-      * @param {string} paymentId - Gateway payment ID
-      * @returns {Promise<{ status: string, amount: number, method: string, rawResponse: object }>}
-      */
-     async fetchPayment(paymentId) {
-          throw new Error('fetchPayment() must be implemented by gateway');
-     }
-
-     /**
       * Initiate a refund.
       * @param {string} paymentId - Gateway payment ID to refund
       * @param {number} amount - Refund amount in base currency
@@ -62,16 +53,6 @@ class BaseGateway {
       */
      async initiateRefund(paymentId, amount, notes = {}) {
           throw new Error('initiateRefund() must be implemented by gateway');
-     }
-
-     /**
-      * Fetch refund details from gateway.
-      * @param {string} paymentId - Gateway payment ID
-      * @param {string} refundId - Gateway refund ID
-      * @returns {Promise<{ status: string, amount: number, rawResponse: object }>}
-      */
-     async fetchRefund(paymentId, refundId) {
-          throw new Error('fetchRefund() must be implemented by gateway');
      }
 }
 
