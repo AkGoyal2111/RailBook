@@ -14,6 +14,9 @@ const { BadRequestError, NotFoundError, ConflictError, StaleStateError } = requi
 // Atomically updates booking status ONLY IF the version hasn't changed since read.
 // Returns the updated booking or throws StaleStateError if another process got there first.
 
+// ye ek safety check h jab hum booking ka status update karna chahte h
+// pehle dekho ki booking ka version wahi h jo humne padha tha (kisi ne beech mein change to nahi kiya)
+// agar version match kiya to update karo, nahi kiya to error do — doosra process pehle pahunch gaya tha
 const casUpdateBooking = async (bookingId, expectedVersion, data) => {
      const result = await prisma.booking.updateMany({
           where: { id: bookingId, version: expectedVersion },
@@ -31,6 +34,9 @@ const casUpdateBooking = async (bookingId, expectedVersion, data) => {
 // Looks up user (and optionally stations) so booking events can carry email/firstName
 // directly. Failures here must never break the booking workflow — log and return null.
 
+// sirf notification ke liye user ka email aur naam fetch karo
+// agar ye fail ho jaye to booking nahi rukegi — sirf warning log hogi
+// kyunki user details na mile to koi baat nahi, booking to honi chahiye
 const fetchUserForNotification = async (userId) => {
      try {
           const user = await userClient.getUserById(userId);
@@ -44,6 +50,8 @@ const fetchUserForNotification = async (userId) => {
      }
 };
 
+// notification mein station ka naam dalna h (sirf display ke liye)
+// agar station service down h to null return karo, booking nahi rukegi
 const fetchStationName = async (stationId) => {
      if (!stationId) return null;
      try {
@@ -60,6 +68,8 @@ const fetchStationName = async (stationId) => {
 
 // ─── Idempotency Helper ──────────────────────────────────────────────────────
 
+// check karo ki ye same request pehle bhi aayi thi ya nahi
+// agar aayi thi to wahi purana response return karo — duplicate booking nahi banegi
 const checkIdempotency = async (key) => {
      const existing = await prisma.idempotencyRecord.findUnique({ where: { eventKey: key } });
      if (existing) {
@@ -69,6 +79,7 @@ const checkIdempotency = async (key) => {
      return null;
 };
 
+// request aur uska response db mein save karo taaki agle baar duplicate request aaye to seedha wahi response do
 const saveIdempotency = async (key, response) => {
      await prisma.idempotencyRecord.create({
           data: { eventKey: key, response },
@@ -78,6 +89,11 @@ const saveIdempotency = async (key, response) => {
 // ─── Create Booking ──────────────────────────────────────────────────────────
 
 // --- SEGMENT BOOKING: Added fromStationId, toStationId, fromSeq, toSeq params ---
+// main booking create karne ka function — ye pura flow h
+// pehle input validate karo, duplicate check karo, schedule aur seats check karo
+// phir redis mein distributed lock lo (taaki koi aur same seat na book kar le)
+// db mein booking create karo, saga se seats hold karo, payment order banao
+// agar kuch bhi fail ho to sab undo karo (compensate) aur booking FAILED mark karo
 const createBooking = async (userId, scheduleId, seatIds, passengers, idempotencyKey, fromStationId, toStationId, fromSeq, toSeq) => {
      // 1. Validate input
      if (!scheduleId || !seatIds || !Array.isArray(seatIds) || seatIds.length === 0) {
@@ -267,6 +283,11 @@ const createBooking = async (userId, scheduleId, seatIds, passengers, idempotenc
 
 // ─── Handle Payment Success (Kafka consumer) ─────────────────────────────────
 
+// kafka consumer — jab payment gateway se SUCCESS event aata h
+// booking find karo, CAS se status CONFIRMING karo (race condition se bacho)
+// inventory mein seats confirm karo (LOCKED se BOOKED)
+// redis locks release karo, booking CONFIRMED karo, notification bhejo
+// agar kuch bhi fail ho to compensate karo aur BOOKING_FAILED kafka pe publish karo
 const handlePaymentSuccess = async (paymentOrderId, gatewayPaymentId, amount) => {
      const booking = await prisma.booking.findUnique({
           where: { paymentOrderId },
@@ -388,6 +409,10 @@ const handlePaymentSuccess = async (paymentOrderId, gatewayPaymentId, amount) =>
 
 // ─── Handle Payment Failure (Kafka consumer) ─────────────────────────────────
 
+// kafka consumer — jab payment gateway se FAILURE event aata h
+// booking find karo, CAS se status FAILED karo
+// jo seats hold ki thi unhe release karo, redis locks bhi release karo
+// user ko BOOKING_FAILED notification bhejo
 const handlePaymentFailure = async (paymentOrderId, reason) => {
      const booking = await prisma.booking.findUnique({
           where: { paymentOrderId },
@@ -452,6 +477,11 @@ const handlePaymentFailure = async (paymentOrderId, reason) => {
 
 // ─── Cancel Booking ──────────────────────────────────────────────────────────
 
+// user ne khud cancel kiya — ye handle karo
+// pehle CAS se CANCELLING status claim karo (koi aur na le jaaye)
+// agar booking CONFIRMED thi: seats release karo + refund start karo
+// agar PAYMENT_PENDING/SEATS_HELD thi: sirf seats unlock karo
+// status CANCELLED karo, redis locks release karo, notification bhejo
 const cancelBooking = async (bookingId, userId) => {
      const booking = await prisma.booking.findUnique({
           where: { id: bookingId },
@@ -575,6 +605,8 @@ const cancelBooking = async (bookingId, userId) => {
 
 // ─── Get Booking ─────────────────────────────────────────────────────────────
 
+// ek specific booking ki poori detail do — seats, passengers sab kuch
+// sirf wahi user dekh sakta h jisne book kiya tha
 const getBooking = async (bookingId, userId) => {
      const booking = await prisma.booking.findUnique({
           where: { id: bookingId },
@@ -625,6 +657,8 @@ const getBooking = async (bookingId, userId) => {
 
 // ─── Get User Bookings ───────────────────────────────────────────────────────
 
+// ek user ki saari bookings list karo with pagination aur optional status filter
+// naye se purani order mein aayengi
 const getUserBookings = async (userId, { status, page = 1, limit = 10 } = {}) => {
      const skip = (page - 1) * limit;
      const where = { userId };
@@ -682,6 +716,9 @@ const getUserBookings = async (userId, { status, page = 1, limit = 10 } = {}) =>
 
 // ─── Verify Payment (client-side verification after Razorpay checkout) ───────
 
+// user ke side se payment complete hone ke baad razorpay ka signature verify karo
+// ye frontend wali step h — razorpay checkout ke baad user yahan aata h confirm karne ke liye
+// actual confirm to kafka event pe hoga, ye sirf signature verify karta h
 const verifyPayment = async (bookingId, userId, razorpayPaymentId, razorpaySignature) => {
      const booking = await prisma.booking.findUnique({
           where: { id: bookingId },
@@ -722,6 +759,10 @@ const verifyPayment = async (bookingId, userId, razorpayPaymentId, razorpaySigna
 // When a schedule is cancelled, all active bookings on that schedule must be
 // failed/cancelled so users aren't left with stranded tickets.
 
+// kafka consumer — jab poori train schedule cancel ho jati h
+// us schedule ki saari active bookings (PENDING/SEATS_HELD/PAYMENT_PENDING/CONFIRMED) ko CANCELLED karo
+// jinka payment ho chuka tha unka refund start karo
+// redis locks release karo, BOOKING_CANCELLED notification bhejo har user ko
 const handleScheduleCancelled = async (scheduleId) => {
      if (!scheduleId) {
           logger.warn('handleScheduleCancelled called without scheduleId');

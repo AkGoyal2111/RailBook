@@ -14,6 +14,10 @@ const { paymentClient } = require('./paymentClient');
 // ─── Forward Steps ───────────────────────────────────────────────────────────
 
 // --- SEGMENT BOOKING: Added fromSeq/toSeq params ---
+// saga ka step 1 — inventory service ko bolo ki ye seats hold karo (lock karo)
+// pehle sagaLog mein PENDING entry banao (audit trail ke liye)
+// phir inventoryClient.holdSeats call karo — success pe sagaLog COMPLETED, booking SEATS_HELD
+// fail pe sagaLog FAILED aur error throw karo
 async function executeHoldSeats(booking, seatIds, ttlSeconds, fromSeq, toSeq) {
      const sagaLog = await prisma.sagaLog.create({
           data: {
@@ -57,6 +61,10 @@ async function executeHoldSeats(booking, seatIds, ttlSeconds, fromSeq, toSeq) {
      }
 }
 
+// saga ka step 2 — payment service ko bolo ki razorpay order banao
+// sagaLog mein PENDING entry, phir paymentClient.createPaymentOrder call karo
+// success pe sagaLog COMPLETED, booking status PAYMENT_PENDING, paymentOrderId save karo
+// fail pe sagaLog FAILED aur error throw karo
 async function executeCreatePayment(booking) {
      const idempotencyKey = `${booking.id}-payment`;
 
@@ -104,6 +112,9 @@ async function executeCreatePayment(booking) {
 }
 
 // --- SEGMENT BOOKING: Added fromSeq/toSeq params ---
+// saga ka step 3 — payment success hone ke baad inventory ko bolo seats confirm karo
+// basically seats ka status LOCKED se BOOKED karo permanently
+// sagaLog PENDING → COMPLETED on success, FAILED on error
 async function executeConfirmSeats(booking, seatIds, fromSeq, toSeq) {
      const sagaLog = await prisma.sagaLog.create({
           data: {
@@ -144,6 +155,9 @@ async function executeConfirmSeats(booking, seatIds, fromSeq, toSeq) {
 
 // ─── Compensation Steps ──────────────────────────────────────────────────────
 
+// compensation step 1 — agar booking fail ho to hold kari hui seats wapas release karo
+// inventory ko bolo unlock karo, phir sagaLog mein COMPENSATED mark karo
+// agar ye bhi fail ho to chinta nahi — lock expire hone pe automatically release ho jayengi
 async function compensateHoldSeats(booking, seatIds) {
      logger.info(`Compensating HOLD_SEATS for booking ${booking.id}`);
      try {
@@ -163,6 +177,8 @@ async function compensateHoldSeats(booking, seatIds) {
      }
 }
 
+// compensation step 2 — agar payment order ban gaya tha to uska refund shuru karo
+// agar paymentOrderId hi nahi tha to kuch karne ki zaroorat nahi
 async function compensateCreatePayment(booking) {
      if (!booking.paymentOrderId) return;
 
@@ -187,6 +203,8 @@ async function compensateCreatePayment(booking) {
      }
 }
 
+// compensation step 3 — agar seats confirm ho gayi thi payment ke baad, aur phir kuch fail hua
+// to inventory ko bolo booking cancel karo (seats wapas available karo)
 async function compensateConfirmSeats(booking) {
      logger.info(`Compensating CONFIRM_SEATS for booking ${booking.id}`);
      try {
@@ -207,6 +225,9 @@ async function compensateConfirmSeats(booking) {
  * Compensate all completed saga steps in reverse order.
  * Used when a booking needs to be rolled back (failure, timeout, cancellation).
  */
+// master undo function — jo bhi saga steps complete ho chuke h unhe ulte order mein undo karo
+// db se check karo kaunse steps COMPLETED the, phir unka compensation chalao
+// order: pehle CONFIRM_SEATS undo, phir CREATE_PAYMENT undo, phir HOLD_SEATS undo
 async function compensateAll(booking, seatIds) {
      const completedSteps = await prisma.sagaLog.findMany({
           where: { bookingId: booking.id, status: 'COMPLETED' },

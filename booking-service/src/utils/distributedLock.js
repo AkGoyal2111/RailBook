@@ -59,6 +59,9 @@ return released
  * @param {number} [toSeq] - Segment end (sequence number)
  * @returns {string[]} Sorted lock keys
  */
+// redis mein lock key ka naam banao is format mein: booking:lock:seat:{scheduleId}:{seatId}
+// agar segment booking h to key mein fromSeq:toSeq bhi lagao
+// taaki alag-alag segments ki alag keys ho (ek segment ka lock doosre segment ko block na kare)
 function buildLockKeys(scheduleId, seatIds, fromSeq, toSeq) {
      const suffix = (fromSeq && toSeq) ? `:${fromSeq}:${toSeq}` : '';
      return [...seatIds]
@@ -76,6 +79,9 @@ function buildLockKeys(scheduleId, seatIds, fromSeq, toSeq) {
  * @param {number} [toSeq] - Segment end (for segment-aware keys)
  * @returns {Promise<{acquired: boolean, lockValue: string|null}>}
  */
+// redis mein in seats pe lock lo (saari seats ek saath ya ek bhi nahi — all or nothing)
+// Lua script atomically chalta h: agar koi bhi seat pehle se locked h to koi lock nahi lagega
+// agar lock mil gaya to lockValue return karo (ye proof h ki lock humara h)
 async function acquireSeatLocks(scheduleId, seatIds, bookingId, ttlSeconds, fromSeq, toSeq) {
      const keys = buildLockKeys(scheduleId, seatIds, fromSeq, toSeq);
      const lockValue = `${bookingId}:${Date.now()}`;
@@ -119,6 +125,9 @@ async function acquireSeatLocks(scheduleId, seatIds, bookingId, ttlSeconds, from
  * @param {number} [fromSeq] - Segment start (for segment-aware keys)
  * @param {number} [toSeq] - Segment end (for segment-aware keys)
  */
+// redis se locks release karo — lekin sirf wahi locks jinhe hum khud ne liya tha (lockValue match karna chahiye)
+// Lua script pehle check karta h ki value match karti h ya nahi, tabhi delete karta h
+// taaki galti se kisi aur ka lock na hatao
 async function releaseSeatLocks(scheduleId, seatIds, lockValue, fromSeq, toSeq) {
      if (!lockValue) return;
 
@@ -144,6 +153,9 @@ async function releaseSeatLocks(scheduleId, seatIds, lockValue, fromSeq, toSeq) 
  * @param {number} [fromSeq] - Segment start (for segment-aware keys)
  * @param {number} [toSeq] - Segment end (for segment-aware keys)
  */
+// forcefully saare locks hata do chahe owner koi bhi ho — no ownership check
+// ye tab use hota h jab pata h ki booking expire ho gayi h ya cancel ho gayi h
+// lock expiry job ya cancel flow is use karta h
 async function forceReleaseSeatLocks(scheduleId, seatIds, fromSeq, toSeq) {
      const keys = buildLockKeys(scheduleId, seatIds, fromSeq, toSeq);
 

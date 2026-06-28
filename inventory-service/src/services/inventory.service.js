@@ -7,6 +7,10 @@ const { config } = require('../config');
 
 // ─── Kafka Event Handlers ───────────────────────────────────────────────────
 
+// jab bhi koi naya train schedule create hota h (kafka event aata h SCHEDULE_CREATED),
+// tab us schedule ki saari seats ka initial inventory set karo db mein
+// basically empty train ka blueprint banana — kitni seats h, sab AVAILABLE mark karo
+// agar same event dobara aaya (duplicate) to ignore karo (idempotency check)
 const initializeInventory = async (eventData) => {
      const { scheduleId, trainId, trainNumber, trainName, departureDate, seats } = eventData;
 
@@ -78,6 +82,9 @@ const initializeInventory = async (eventData) => {
      }
 };
 
+// jab train schedule cancel ho jata h to kafka se event aata h
+// us schedule ki saari seats ko CANCELLED mark karo, available/locked/booked sab 0 karo
+// basically poori train ka inventory band karo taaki koi book na kar sake
 const cancelScheduleInventory = async (eventData) => {
      const data = eventData.data || eventData;
      const scheduleId = data.scheduleId || data.id;
@@ -136,6 +143,11 @@ const cancelScheduleInventory = async (eventData) => {
  * Returns the count of seats whose status actually changed to/from AVAILABLE
  * so the caller can decide whether aggregate counters need adjusting.
  */
+// ye helper function h jo segment booking ke baad har seat ka overall status recalculate karta h
+// logic simple h: agar seat pe koi bhi ek LOCKED segment h to seat = LOCKED
+//                 agar sab segments BOOKED h to seat = BOOKED
+//                 agar koi bhi active lock nahi h to seat = AVAILABLE
+// basically seat_segment_locks table dekho aur seat_inventories mein summary update karo
 async function recomputeSegmentSeatStatuses(tx, scheduleId, seatIds) {
      const statusChanges = { nowAvailable: 0, nowOccupied: 0, lockedToBooked: 0, bookedToLocked: 0 };
 
@@ -191,6 +203,9 @@ async function recomputeSegmentSeatStatuses(tx, scheduleId, seatIds) {
  * Recount schedule_inventories aggregate columns from actual seat_inventories rows.
  * This is the source of truth — avoids counter drift from arithmetic updates.
  */
+// ye function actual seats ginta h db se (AVAILABLE/LOCKED/BOOKED) aur schedule ka counter update karta h
+// arithmetic nahi karta (available - 2 wala), seedha count karta h from seat_inventories
+// kyunki segment booking mein arithmetic galat ho sakti h (ek seat partially locked ho sakti h)
 async function recountScheduleAggregates(tx, scheduleId) {
      const counts = await tx.$queryRaw`
           SELECT
@@ -215,6 +230,8 @@ async function recountScheduleAggregates(tx, scheduleId) {
 
 // ─── REST API Handlers ──────────────────────────────────────────────────────
 
+// simple h — ek schedule ki overall availability do
+// kitni seats total h, kitni available h, kitni locked h, kitni booked h — ye sab return karo
 const getAvailability = async (scheduleId) => {
      const schedule = await prisma.scheduleInventory.findUnique({ where: { scheduleId } });
      if (!schedule) throw new NotFoundError('Schedule not found in inventory');
@@ -233,6 +250,9 @@ const getAvailability = async (scheduleId) => {
      };
 };
 
+// ek schedule ki individual seats ki list do with filters (status, seatType)
+// agar fromSeq/toSeq diya h (segment booking) to batao ki us segment ke liye kaunsi seats available h
+// overlapping locks wali seats ko UNAVAILABLE mark karo — baaki sab AVAILABLE
 const getSeats = async (scheduleId, filters = {}) => {
      const schedule = await prisma.scheduleInventory.findUnique({ where: { scheduleId } });
      if (!schedule) throw new NotFoundError('Schedule not found in inventory');
@@ -306,6 +326,11 @@ const getSeats = async (scheduleId, filters = {}) => {
 };
 
 // --- SEGMENT BOOKING: Added fromSeq/toSeq params for segment-aware locking ---
+// main locking function — jab user seats select karta h booking ke liye
+// pehle ttl calculate karo, schedule check karo, db mein seat rows pe lock lagao
+// agar segment h (fromSeq/toSeq) — overlap check karo, seat_segment_locks mein row daalo, recompute karo
+// agar full journey h (no segment) — seedha check karo seats AVAILABLE hain ya nahi, LOCKED mark karo
+// last mein kafka ko update bhej do ki seats lock ho gayi
 const lockSeats = async (scheduleId, seatIds, userId, ttlSeconds, fromSeq, toSeq) => {
      const ttl = Math.min(Math.max(ttlSeconds || config.LOCK_TTL_SECONDS, 60), 600);
      const lockExpiresAt = new Date(Date.now() + ttl * 1000);
@@ -464,6 +489,10 @@ const lockSeats = async (scheduleId, seatIds, userId, ttlSeconds, fromSeq, toSeq
 };
 
 // --- SEGMENT BOOKING: Added fromSeq/toSeq params for segment-aware unlocking ---
+// jab user booking cancel kare ya lock expire ho to seats release karo
+// agar segment h — specific segment lock row delete karo, baki segments pe koi asar nahi
+// agar full journey h — check karo ki ye seats is user ne hi lock ki thin, phir AVAILABLE mark karo
+// last mein kafka ko update bhej do
 const unlockSeats = async (scheduleId, seatIds, userId, fromSeq, toSeq) => {
      const result = await retryTransaction(async () => {
           return prisma.$transaction(async (tx) => {
@@ -570,6 +599,10 @@ const unlockSeats = async (scheduleId, seatIds, userId, fromSeq, toSeq) => {
 };
 
 // --- SEGMENT BOOKING: Added fromSeq/toSeq params for segment-aware confirmation ---
+// payment success hone ke baad seats ko permanently BOOKED mark karo
+// agar segment h — seat_segment_locks mein status LOCKED se BOOKED karo, recompute karo
+// agar full journey h — seedha seat_inventories mein BOOKED mark karo
+// agar lock already expire ho gaya h to error do — user ko dobara lock karna padega
 const confirmSeats = async (scheduleId, seatIds, userId, bookingId, fromSeq, toSeq) => {
      const result = await retryTransaction(async () => {
           return prisma.$transaction(async (tx) => {
@@ -695,6 +728,10 @@ const confirmSeats = async (scheduleId, seatIds, userId, bookingId, fromSeq, toS
      return result;
 };
 
+// confirmed booking cancel karo — seats wapas AVAILABLE karo
+// pehle segment locks check karo (agar segment booking thi to wahan se delete karo)
+// agar normal full-journey booking thi to seat_inventories mein AVAILABLE karo
+// dono cases mein kafka update bhejo
 const cancelBooking = async (scheduleId, bookingId, userId) => {
      const result = await retryTransaction(async () => {
           return prisma.$transaction(async (tx) => {
@@ -791,6 +828,9 @@ const cancelBooking = async (scheduleId, bookingId, userId) => {
 
 // ─── Lock Expiry Helper (used by lockExpiry.js) ─────────────────────────────
 
+// lock expiry job use karta h ise — jab seats expire ho jaati h to ye function
+// ek baar phir se seats ginta h db se aur schedule ka counter fresh karta h
+// phir kafka pe updated counts bhej deta h
 const recountAndPublish = async (scheduleId) => {
      const counts = await prisma.$queryRaw`
           SELECT

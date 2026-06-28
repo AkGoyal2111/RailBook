@@ -14,6 +14,9 @@ const client = axios.create({
 /**
  * Retry wrapper with exponential backoff.
  */
+// agar inventory service se request fail ho to 3 baar try karo (exponential backoff ke saath)
+// 4xx errors pe retry mat karo (client ki galti h, dobara bhejne se kya fayda)
+// sirf 5xx ya network errors pe retry karo
 async function withRetry(fn, maxRetries = 3) {
      let lastError;
      for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -40,6 +43,8 @@ async function withRetry(fn, maxRetries = 3) {
 /**
  * Extract error message from axios error.
  */
+// axios error se clean error object nikalo — status, message, error code
+// agar response hi nahi mila (network error) to generic 500 error do
 function extractError(error) {
      if (error.response?.data) {
           return {
@@ -52,6 +57,8 @@ function extractError(error) {
 }
 
 const inventoryClient = {
+     // ek schedule ke liye overall availability check karo inventory service se
+     // kitni seats h, kitni available h — ye data milega
      async getAvailability(scheduleId) {
           return withRetry(async () => {
                const { data } = await client.get(`/schedules/${scheduleId}/availability`);
@@ -59,6 +66,8 @@ const inventoryClient = {
           });
      },
 
+     // individual seats ki list lo with filters
+     // segment booking ke liye fromSeq/toSeq bhi pass karo taaki segment-aware availability mile
      async getSeats(scheduleId, filters = {}) {
           return withRetry(async () => {
                const params = {};
@@ -73,6 +82,8 @@ const inventoryClient = {
      },
 
      // --- SEGMENT BOOKING: Added fromSeq/toSeq params to holdSeats, releaseSeats, confirmSeats ---
+     // inventory service ko bolo ye seats lock karo is user ke liye
+     // segment h to fromSeq/toSeq bhi bhejo taaki sirf us segment ke liye lock ho
      async holdSeats(scheduleId, seatIds, userId, ttlSeconds, fromSeq, toSeq) {
           return withRetry(async () => {
                const { data } = await client.post('/seats/lock', {
@@ -87,6 +98,8 @@ const inventoryClient = {
           });
      },
 
+     // inventory service ko bolo ye seats unlock karo (release karo)
+     // segment booking mein sirf us segment ki lock release hogi, seat poori free nahi hogi
      async releaseSeats(scheduleId, seatIds, userId, fromSeq, toSeq) {
           return withRetry(async () => {
                const { data } = await client.post('/seats/unlock', {
@@ -100,6 +113,8 @@ const inventoryClient = {
           });
      },
 
+     // payment success ke baad inventory ko bolo seats permanently BOOKED karo
+     // segment booking mein sirf us segment ke lock BOOKED hote h, baaki unaffected
      async confirmSeats(scheduleId, seatIds, userId, bookingId, fromSeq, toSeq) {
           return withRetry(async () => {
                const { data } = await client.post('/seats/confirm', {
@@ -114,6 +129,8 @@ const inventoryClient = {
           });
      },
 
+     // confirmed booking cancel karne ke liye inventory service ko bolo
+     // seats wapas AVAILABLE ho jayengi
      async cancelBooking(scheduleId, bookingId, userId) {
           return withRetry(async () => {
                const { data } = await client.post('/seats/cancel-booking', {
