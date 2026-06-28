@@ -19,6 +19,7 @@
 - [Services](#-services)
 - [Kafka Topics](#-kafka-topics)
 - [API Documentation](#-api-documentation)
+- [Testing & CI](#-testing--ci)
 - [Environment Variables](#-environment-variables)
 - [Project Structure](#-project-structure)
 
@@ -31,7 +32,7 @@ This project demonstrates a complete microservices architecture for a railway bo
 - **Microservices Design Patterns** — Database-per-service, API Gateway, Saga
 - **Inter-Service Communication** — REST (sync) and Kafka (async/event-driven)
 - **Authentication & Authorization** — JWT (access + refresh), OTP via email, Google OAuth
-- **Database Management** — PostgreSQL via Prisma ORM (5 services), Elasticsearch (search)
+- **Database Management** — PostgreSQL via Prisma ORM (database-per-service); search served directly from admin-service (no Elasticsearch)
 - **Caching & Locking** — Redis for sessions, OTP storage, distributed seat locks
 - **Containerization** — Docker Compose for the full infra stack
 - **Resilience** — Rate limiting, circuit breakers, Dead-Letter Queues (DLQ) on every Kafka consumer
@@ -42,6 +43,26 @@ This project demonstrates a complete microservices architecture for a railway bo
 - Coordinate distributed transactions with Saga + Kafka
 - Handle concurrent seat reservations with Redis distributed locks
 - Build a production-style API Gateway with proxying, JWT enforcement, rate limiting, and circuit breakers
+
+---
+
+## 🧪 Testing & CI
+
+Unit tests cover the trickiest correctness areas, using Node's built-in test runner (`node --test`) — zero extra dependencies.
+
+| Service | What's tested |
+|---------|---------------|
+| `api-gateway` | Circuit breaker state machine (CLOSED → OPEN → HALF_OPEN → CLOSED, threshold, fast-fail) |
+| `payment-service` | Razorpay payment + webhook **signature verification** (security-critical) |
+| `user-service` | JWT access/refresh token generation & verification, token hashing |
+
+Run tests for any service:
+
+```bash
+cd api-gateway && npm test     # or payment-service / user-service
+```
+
+**Continuous Integration:** every push and pull request to `main` runs all suites in parallel via GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)). The build fails if any test fails, so broken code can't be merged.
 
 ---
 
