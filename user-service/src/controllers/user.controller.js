@@ -20,14 +20,6 @@ exports.getProfile = asyncHandler(async(req, res) =>{
      })
 })
 
-exports.updateProfile = asyncHandler(async(req, res) =>{
-     // TODO TASK FOR YOU
-})
-
-exports.deleteProfile = asyncHandler(async(req, res) =>{
-     // TODO TASK FOR YOU
-})
-
 exports.getUserInternal = asyncHandler(async(req, res) =>{
      const { userId } = req.params;
      if(!userId){
