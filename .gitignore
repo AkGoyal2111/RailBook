@@ -102,6 +102,8 @@ junit.xml
 # PostgreSQL dumps
 *.sql
 *.dump
+# ...but keep the DB bootstrap script (needed for local run + deployment)
+!db/init/*.sql
 
 # ============ Docker ============
 # Docker volumes and data (managed by docker-compose)

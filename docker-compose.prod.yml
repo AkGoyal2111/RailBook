@@ -1,0 +1,207 @@
+# =====================================================================
+# Full production stack — infra + all services + frontend.
+# Usage (on the server):
+#   cp .env.prod.example .env   # fill in values
+#   docker compose -f docker-compose.prod.yml up -d --build
+# =====================================================================
+name: railbook
+
+services:
+  # ----------------------- Infrastructure -----------------------
+  postgres:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [railbook-net]
+
+  redis:
+    image: redis/redis-stack:6.2.6-v19
+    restart: always
+    environment:
+      REDIS_ARGS: "--requirepass ${REDIS_PASSWORD}"
+    volumes:
+      - redis_data:/data
+    networks: [railbook-net]
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    restart: always
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks: [railbook-net]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    restart: always
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks: [railbook-net]
+
+  # ----------------------- Application services -----------------------
+  user-service:
+    build: { context: ., dockerfile: user-service/Dockerfile }
+    restart: always
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PORT: 4001
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/user_service_database
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      ALLOWED_ORIGINS: ${PUBLIC_ORIGIN}
+      OTP_TTL: 300
+      OTP_HMAC_SECRET: ${OTP_HMAC_SECRET}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      ACCESS_TOKEN_EXP: 15m
+      REFRESH_TOKEN_EXP: 7d
+      ACCESS_TOKEN_EXP_SEC: 900
+      REFRESH_TOKEN_EXP_SEC: 604800
+      REDIS_USER_TTL: 86400
+      GMAIL_USER: ${GMAIL_USER}
+      GMAIL_APP_PASSWORD: ${GMAIL_APP_PASSWORD}
+      MAIL_FROM: ${MAIL_FROM}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY}
+    networks: [railbook-net]
+
+  admin-service:
+    build: { context: ., dockerfile: admin-service/Dockerfile }
+    restart: always
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_started }
+    environment:
+      PORT: 4003
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/admin_service_database
+      ALLOWED_ORIGINS: ${PUBLIC_ORIGIN}
+      KAFKA_BROKER: kafka:9092
+      KAFKA_CLIENT_ID: admin-service
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY}
+    networks: [railbook-net]
+
+  inventory-service:
+    build: { context: ., dockerfile: inventory-service/Dockerfile }
+    restart: always
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_started }
+    environment:
+      PORT: 4007
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/inventory_service_database
+      ALLOWED_ORIGINS: ${PUBLIC_ORIGIN}
+      KAFKA_BROKER: kafka:9092
+      KAFKA_CLIENT_ID: inventory-service
+      LOCK_TTL_SECONDS: 300
+      LOCK_EXPIRY_INTERVAL_MS: 60000
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY}
+    networks: [railbook-net]
+
+  payment-service:
+    build: { context: ., dockerfile: payment-service/Dockerfile }
+    restart: always
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_started }
+    environment:
+      PORT: 4006
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/payment_service_database
+      ALLOWED_ORIGINS: ${PUBLIC_ORIGIN}
+      KAFKA_BROKER: kafka:9092
+      KAFKA_CLIENT_ID: payment-service
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY}
+      PAYMENT_GATEWAY: razorpay
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET}
+    networks: [railbook-net]
+
+  booking-service:
+    build: { context: ., dockerfile: booking-service/Dockerfile }
+    restart: always
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_started }
+    environment:
+      PORT: 4005
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/booking_service_database
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      ALLOWED_ORIGINS: ${PUBLIC_ORIGIN}
+      KAFKA_BROKER: kafka:9092
+      KAFKA_CLIENT_ID: booking-service
+      USER_SERVICE_URL: http://user-service:4001
+      ADMIN_SERVICE_URL: http://admin-service:4003
+      PAYMENT_SERVICE_URL: http://payment-service:4006
+      INVENTORY_SERVICE_URL: http://inventory-service:4007
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY}
+      BOOKING_TTL_SECONDS: 600
+      BOOKING_EXPIRY_CHECK_INTERVAL_MS: 30000
+      LOCK_TTL_SECONDS: 600
+    networks: [railbook-net]
+
+  api-gateway:
+    build: { context: ., dockerfile: api-gateway/Dockerfile }
+    restart: always
+    depends_on: [user-service, admin-service, booking-service, payment-service, inventory-service]
+    environment:
+      PORT: 4000
+      NODE_ENV: production
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      ALLOWED_ORIGINS: ${PUBLIC_ORIGIN}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      ACCESS_TOKEN_EXP_SEC: 900
+      REFRESH_TOKEN_EXP_SEC: 604800
+      USER_SERVICE_URL: http://user-service:4001
+      ADMIN_SERVICE_URL: http://admin-service:4003
+      BOOKING_SERVICE_URL: http://booking-service:4005
+      PAYMENT_SERVICE_URL: http://payment-service:4006
+      INVENTORY_SERVICE_URL: http://inventory-service:4007
+      SERVICE_TIMEOUT_MS: 60000
+      CIRCUIT_BREAKER_THRESHOLD: 5
+      CIRCUIT_BREAKER_TIMEOUT: 60000
+    networks: [railbook-net]
+
+  frontend:
+    build: { context: ., dockerfile: frontend/Dockerfile }
+    restart: always
+    depends_on: [api-gateway]
+    ports:
+      - "80:80"
+    networks: [railbook-net]
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+
+networks:
+  railbook-net:
+    driver: bridge
