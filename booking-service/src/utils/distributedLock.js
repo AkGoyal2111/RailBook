@@ -14,7 +14,9 @@ const logger = require('../config/logger');
 const ACQUIRE_SCRIPT = `
 local lockValue = ARGV[1]
 local ttl = tonumber(ARGV[2])
-local acquired = {}
+local acquired = {} 
+
+// a2 a3 a4  
 
 for i, key in ipairs(KEYS) do
      local result = redis.call('SET', key, lockValue, 'NX', 'EX', ttl)
@@ -67,7 +69,9 @@ function buildLockKeys(scheduleId, seatIds, fromSeq, toSeq) {
      return [...seatIds]
           .sort()
           .map(seatId => `booking:lock:seat:${scheduleId}:${seatId}${suffix}`);
-}
+} 
+
+// a2  ->  bookng ,loc,,seat.123.a2.DM 
 
 /**
  * Acquire distributed locks for a set of seats.

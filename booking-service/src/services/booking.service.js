@@ -16,7 +16,10 @@ const { BadRequestError, NotFoundError, ConflictError, StaleStateError } = requi
 
 // ye ek safety check h jab hum booking ka status update karna chahte h
 // pehle dekho ki booking ka version wahi h jo humne padha tha (kisi ne beech mein change to nahi kiya)
-// agar version match kiya to update karo, nahi kiya to error do — doosra process pehle pahunch gaya tha
+// agar version match kiya to update karo, nahi kiya to error do — doosra process pehle pahunch gaya tha  
+
+ 
+//CAS 
 const casUpdateBooking = async (bookingId, expectedVersion, data) => {
      const result = await prisma.booking.updateMany({
           where: { id: bookingId, version: expectedVersion },
@@ -102,7 +105,7 @@ const createBooking = async (userId, scheduleId, seatIds, passengers, idempotenc
      if (!passengers || !Array.isArray(passengers) || passengers.length === 0) {
           throw new BadRequestError('passengers (non-empty array) is required');
      }
-     if (seatIds.length !== passengers.length) {
+     if (seatIds.length !== passengers.length) { 
           throw new BadRequestError('Number of seats must match number of passengers');
      }
      if (!idempotencyKey) {
@@ -153,7 +156,9 @@ const createBooking = async (userId, scheduleId, seatIds, passengers, idempotenc
           }
           bookingSeats.push(seat);
           totalAmount += seat.price;
-     }
+     } 
+
+     // verify avail 
 
      // 4. Sort seatIds (deadlock prevention for distributed locks)
      const sortedSeatIds = [...seatIds].sort();
@@ -227,8 +232,8 @@ const createBooking = async (userId, scheduleId, seatIds, passengers, idempotenc
           booking = await prisma.booking.findUnique({
                where: { id: booking.id },
                include: { seats: true, passengers: true },
-          });
-
+          });  
+          
           // 9. Save idempotency
           const response = {
                bookingId: booking.id,
@@ -865,3 +870,4 @@ module.exports = {
      getUserBookings,
      verifyPayment,
 };
+          

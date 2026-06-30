@@ -50,6 +50,9 @@ error.log
 access.log
 
 # ============ IDE & Editors ============
+# AI assistant config
+.claude/
+
 # VS Code
 .vscode/settings.json
 .vscode/launch.json

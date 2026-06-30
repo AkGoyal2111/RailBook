@@ -1,787 +1,342 @@
-# 🚆 IRCTC Backend - Microservices Architecture
+# RailBook
 
-> A production-grade microservices-based railway booking system backend, built for learning and demonstrating enterprise architecture patterns.
+A distributed railway reservation system built on microservices. Six backend services coordinate through Kafka events and synchronous REST to handle the full lifecycle — from user registration and train management to seat locking, payment processing, and booking confirmation.
 
-**YouTube Tutorial Series**: https://youtu.be/K_cTtCXCPeY?si=VLIxFdgK2k3XraXA
-
----
-
-## 📋 Table of Contents
-
-- [Overview](#-overview)
-- [Architecture](#-architecture)
-- [Port Reference](#-port-reference)
-- [Tech Stack](#-tech-stack)
-- [Getting Started](#-getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-  - [Running the Application](#running-the-application)
-- [Services](#-services)
-- [Kafka Topics](#-kafka-topics)
-- [API Documentation](#-api-documentation)
-- [Testing & CI](#-testing--ci)
-- [Environment Variables](#-environment-variables)
-- [Project Structure](#-project-structure)
+The system solves hard concurrency problems: two users racing for the same seat on overlapping journey segments are handled correctly through Redis distributed locks, Postgres row-level locking (`FOR UPDATE NOWAIT`), and a Saga-based transaction orchestrator that knows how to roll itself back.
 
 ---
 
-## 🎯 Overview
+## What Makes This Non-Trivial
 
-This project demonstrates a complete microservices architecture for a railway booking system (IRCTC clone), covering:
+Most booking systems treat a seat as binary — booked or not. This one implements **segment-aware seat locking**: a seat on the Delhi→Mumbai route can be simultaneously booked by one passenger for Delhi→Jaipur and another for Jaipur→Mumbai, because their segments don't overlap. The inventory service maintains per-segment lock rows and recomputes seat availability from the ground truth on every state transition.
 
-- **Microservices Design Patterns** — Database-per-service, API Gateway, Saga
-- **Inter-Service Communication** — REST (sync) and Kafka (async/event-driven)
-- **Authentication & Authorization** — JWT (access + refresh), OTP via email, Google OAuth
-- **Database Management** — PostgreSQL via Prisma ORM (database-per-service); search served directly from admin-service (no Elasticsearch)
-- **Caching & Locking** — Redis for sessions, OTP storage, distributed seat locks
-- **Containerization** — Docker Compose for the full infra stack
-- **Resilience** — Rate limiting, circuit breakers, Dead-Letter Queues (DLQ) on every Kafka consumer
-
-**🎓 Learning Objectives:**
-- Build scalable microservices with database-per-service ownership
-- Implement real-world authentication flows (OTP + JWT + Google OAuth)
-- Coordinate distributed transactions with Saga + Kafka
-- Handle concurrent seat reservations with Redis distributed locks
-- Build a production-style API Gateway with proxying, JWT enforcement, rate limiting, and circuit breakers
+**Other things worth noting:**
+- **Saga orchestrator** with full compensation — if payment fails after seats are locked, the system automatically releases locks, refunds payments, and logs every step to a `SagaLog` table for crash recovery
+- **Two layers of locking** — Redis Lua scripts provide all-or-nothing distributed locks (fast rejection), while Postgres `FOR UPDATE NOWAIT` provides the transactional consistency guarantee
+- **Dead-letter queues** on every Kafka consumer — poison messages get retried 3× then shunted to `dlq.<service>` topics instead of blocking the consumer
+- **Circuit breakers** in the API Gateway — downstream service failures trip breakers (CLOSED → OPEN → HALF_OPEN → CLOSED) with configurable thresholds, preventing cascade failures
+- **Booking expiry daemon** — a background job sweeps expired seat locks every 30s, releasing them and compensating the full saga
 
 ---
 
-## 🧪 Testing & CI
-
-Unit tests cover the trickiest correctness areas, using Node's built-in test runner (`node --test`) — zero extra dependencies.
-
-| Service | What's tested |
-|---------|---------------|
-| `api-gateway` | Circuit breaker state machine (CLOSED → OPEN → HALF_OPEN → CLOSED, threshold, fast-fail) |
-| `payment-service` | Razorpay payment + webhook **signature verification** (security-critical) |
-| `user-service` | JWT access/refresh token generation & verification, token hashing |
-
-Run tests for any service:
-
-```bash
-cd api-gateway && npm test     # or payment-service / user-service
-```
-
-**Continuous Integration:** every push and pull request to `main` runs all suites in parallel via GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)). The build fails if any test fails, so broken code can't be merged.
-
----
-
-## 🏗️ Architecture
+## Architecture
 
 ```
-                            ┌───────────────────────┐
-                            │  Frontend (React)     │
-                            │  Port 3000            │
-                            └───────────┬───────────┘
-                                        │
-                            ┌───────────▼───────────┐
-                            │   API Gateway         │
-                            │   Port 4000           │
-                            │ (JWT, rate limit,     │
-                            │  circuit breaker)     │
-                            └───┬───────┬───────┬───┘
-              ┌─────────────────┼───────┼───────┼───────────────┐
-              │                 │       │       │               │
-   ┌──────────▼──────┐ ┌────────▼─┐ ┌───▼────┐ ┌▼──────────┐ ┌──▼──────────┐
-   │ User Service    │ │ Search   │ │ Admin  │ │ Booking   │ │ Payment     │
-   │ Port 4001       │ │ 4002     │ │ 4003   │ │ 4005      │ │ 4006        │
-   └────────┬────────┘ └────┬─────┘ └───┬────┘ └─────┬─────┘ └─────┬───────┘
-            │               │           │            │             │
-            │          ┌────▼──────┐    │     ┌──────▼─────┐       │
-            │          │ Inventory │    │     │ Notification│      │
-            │          │ 4007      │    │     │ 4004 (Kafka)│      │
-            │          └────┬──────┘    │     └──────┬──────┘      │
-            │               │           │            │             │
-            └───────────────┴───────────┴────────────┴─────────────┘
-                                      │
-                ┌─────────────────────┼─────────────────────┐
-                │                     │                     │
-        ┌───────▼──────┐    ┌─────────▼────────┐   ┌────────▼────────┐
-        │  PostgreSQL  │    │  Redis Stack     │   │   Kafka         │
-        │  Port 5432   │    │  Port 6379/8001  │   │   Port 9092/9093│
-        └──────────────┘    └──────────────────┘   └─────────────────┘
-                                                            │
-                                                  ┌─────────▼─────────┐
-                                                  │  Elasticsearch    │
-                                                  │  Port 9200        │
-                                                  └───────────────────┘
+                       ┌──────────────────┐
+                       │  Frontend        │
+                       │  React + Vite    │
+                       │  Port 3000       │
+                       └────────┬─────────┘
+                                │
+                       ┌────────▼─────────┐
+                       │  API Gateway     │
+                       │  Port 4000       │
+                       │  JWT · rate-limit│
+                       │  circuit breaker │
+                       └──┬──┬──┬──┬──┬───┘
+          ┌───────────────┘  │  │  │  └──────────────┐
+          │          ┌───────┘  │  └───────┐          │
+  ┌───────▼──────┐ ┌─▼──────┐ ┌▼───────┐ ┌▼────────┐ ┌▼──────────┐
+  │ User Service │ │ Admin  │ │Booking │ │Payment  │ │ Inventory │
+  │ 4001         │ │ 4003   │ │ 4005   │ │ 4006    │ │ 4007      │
+  │ auth, OTP,   │ │stations│ │ saga,  │ │Razorpay │ │ seats,    │
+  │ JWT, OAuth   │ │trains, │ │ expiry │ │orders,  │ │ segments, │
+  │              │ │routes, │ │        │ │refunds, │ │ locks     │
+  │              │ │search  │ │        │ │webhooks │ │           │
+  └──────┬───────┘ └───┬────┘ └───┬────┘ └────┬────┘ └─────┬─────┘
+         │             │          │            │            │
+         └─────────────┴──────┬───┴────────────┴────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+      ┌───────▼──────┐ ┌─────▼──────┐ ┌──────▼──────┐
+      │  PostgreSQL  │ │   Redis    │ │    Kafka    │
+      │  5432        │ │   6379     │ │  9092/9093  │
+      │  5 databases │ │  locks,    │ │  events,    │
+      │  (per svc)   │ │  sessions, │ │  DLQs       │
+      │              │ │  OTP cache │ │             │
+      └──────────────┘ └────────────┘ └─────────────┘
 ```
 
-**Highlights:**
-- **API Gateway** is the single entrypoint for the frontend; it proxies to the right service and enforces JWT, rate limits, and circuit breakers.
-- **Database-per-service** — each service owns its own Postgres database, search-service uses Elasticsearch.
-- **Event-driven** — Kafka decouples booking, payment, inventory, search and notification flows. Topics are centralized in [shared/constants/kafka-topics.js](shared/constants/kafka-topics.js).
-- **Notification service has no HTTP API** — it is purely a Kafka consumer that sends emails via SendGrid.
+**Key design decision:** Search is handled directly by the admin-service via PostgreSQL queries — no Elasticsearch dependency. Notifications (OTP emails, booking confirmations) are sent inline by the user-service using Nodemailer + Gmail SMTP. This keeps the service count at 6 without sacrificing functionality.
 
 ---
 
-## 🔌 Port Reference
+## Services
 
-A single quick-glance table of every port the project uses.
-
-### Application Services
-
-| Service | Port | Direct URL |
-|---|---|---|
-| Frontend (Vite + React) | 3000 | http://localhost:3000 |
-| API Gateway | 4000 | http://localhost:4000 |
-| User Service | 4001 | http://localhost:4001 |
-| Search Service | 4002 | http://localhost:4002 |
-| Admin Service | 4003 | http://localhost:4003 |
-| Notification Service | 4004 | (Kafka-only, no HTTP) |
-| Booking Service | 4005 | http://localhost:4005 |
-| Payment Service | 4006 | http://localhost:4006 |
-| Inventory Service | 4007 | http://localhost:4007 |
-
-### Infrastructure (from [docker-compose.yml](docker-compose.yml))
-
-| Component | Port(s) | Access |
-|---|---|---|
-| PostgreSQL 15 | 5432 | `admin` / `irctcpass` |
-| pgAdmin | 8081 | http://localhost:8081 — `admin@admin.com` / `admin` |
-| Redis Stack | 6379 (Redis), 8001 (RedisInsight) | password `irctcpass` — RedisInsight at http://localhost:8001 |
-| Zookeeper | 2181 | — |
-| Kafka | 9092 (internal), 9093 (host) | host clients connect to `localhost:9093` |
-| Kafka UI | 8080 | http://localhost:8080 |
-| Elasticsearch 8.12 | 9200 | http://localhost:9200 (single-node, security disabled) |
-| Kibana 8.12 | 5601 | http://localhost:5601 |
+| # | Service | Port | Database | Role |
+|---|---------|------|----------|------|
+| 1 | **API Gateway** | 4000 | — | Single entrypoint. JWT enforcement, per-route rate limiting, request proxying, circuit breakers |
+| 2 | **User Service** | 4001 | `user_service_database` | Registration, OTP email, JWT (access+refresh), Google OAuth, profile CRUD |
+| 3 | **Admin Service** | 4003 | `admin_service_database` | Stations, trains, routes, schedules CRUD. Publishes domain events. Also serves train search queries |
+| 4 | **Booking Service** | 4005 | `booking_service_database` | Saga orchestrator: lock seats → create payment → confirm/compensate. Background expiry job |
+| 5 | **Payment Service** | 4006 | `payment_service_database` | Razorpay order creation, signature verification, webhook processing, refunds |
+| 6 | **Inventory Service** | 4007 | `inventory_service_database` | Per-schedule seat management, segment-aware locking, availability aggregation |
 
 ---
 
-## 🛠️ Tech Stack
+## Kafka Event Flow
 
-### Backend
-- **Runtime**: Node.js (v18+)
-- **Language**: JavaScript (ES Modules)
-- **Framework**: Express.js 5
-- **ORM**: Prisma 7 (user, admin, booking, payment, inventory)
-- **Authentication**: JWT (access + refresh), OTP via SendGrid, Google OAuth (`google-auth-library`)
-- **Search**: Elasticsearch 8.12
-- **Logging**: Winston
-- **Security**: Helmet, CORS, bcrypt
-- **Payments**: Razorpay SDK
-- **Messaging**: KafkaJS
+All topic names are centralized in [`shared/constants/kafka-topics.js`](shared/constants/kafka-topics.js).
 
-### Frontend
-- React 18 + Vite 6
-- React Router 6, Zustand (state), React Hook Form, Axios
-- Tailwind CSS 3
-- Dev server proxies `/api` → API Gateway (port 4000)
+```
+admin-service ──────────────────────────────────────────────────────────────
+  │ SCHEDULE_CREATED ──► inventory-service (creates seat inventory)
+  │ SCHEDULE_CANCELLED ──► inventory-service (cancels all seats)
+  │                    ──► booking-service (cancels affected bookings)
 
-### Databases & Caching
-- **PostgreSQL 15** — one database per Prisma service
-- **Redis Stack** — sessions, OTP cache, distributed seat locks, rate-limit counters
-- **Elasticsearch 8.12** — train and station search index
+payment-service ────────────────────────────────────────────────────────────
+  │ PAYMENT_SUCCESS ──► booking-service (confirms seats via saga)
+  │ PAYMENT_FAILED  ──► booking-service (compensates — releases locks)
 
-### Messaging
-- **Apache Kafka** (Confluent 7.5) with Zookeeper
-- **Kafka UI** for topic inspection
-- Dead-Letter Queue topics (`dlq.<service>`) for every consumer
+inventory-service ──────────────────────────────────────────────────────────
+  │ SEAT_AVAILABILITY_UPDATED ──► (available for downstream consumers)
 
-### DevOps
-- Docker, Docker Compose
-- pgAdmin, RedisInsight, Kafka UI, Kibana
+booking-service ────────────────────────────────────────────────────────────
+  │ BOOKING_CONFIRMED / FAILED / CANCELLED ──► (available for consumers)
+
+Every consumer wraps handlers with shared/utils/dlqHandler.js:
+  3 retries → publish to dlq.<service-name> topic
+```
 
 ---
 
-## 🚀 Getting Started
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Runtime | Node.js 20+, JavaScript (ES Modules) |
+| Framework | Express.js 5 |
+| ORM | Prisma 7 (5 services) |
+| Auth | JWT (access + refresh tokens), OTP via Gmail SMTP, Google OAuth |
+| Payments | Razorpay SDK + webhook signature verification |
+| Messaging | KafkaJS (Confluent 7.5 broker) |
+| Caching & Locking | Redis Stack (ioredis) — sessions, OTP, distributed seat locks via Lua scripts |
+| Database | PostgreSQL 15 — one database per service |
+| Logging | Winston |
+| Security | Helmet, CORS, bcrypt |
+| Frontend | React 18, Vite 6, Tailwind CSS 3, Zustand, React Hook Form |
+| CI | GitHub Actions — parallel test suites on every push/PR |
+| Deployment | Docker Compose (dev + production), nginx reverse proxy |
+
+---
+
+## Running Locally
 
 ### Prerequisites
 
-| Tool | Version | Download |
-|---|---|---|
-| Node.js | >= 18.0.0 | [nodejs.org](https://nodejs.org/) |
-| npm | >= 9.0.0 | (bundled with Node.js) |
-| Docker | >= 20.0.0 | [docker.com](https://www.docker.com/) |
-| Docker Compose | >= 2.0.0 | (bundled with Docker Desktop) |
-| Git | >= 2.30.0 | [git-scm.com](https://git-scm.com/) |
+- Node.js ≥ 20 and npm
+- Docker and Docker Compose
+- Git
+
+### Quick Start (everything in Docker)
 
 ```bash
-node --version
-npm --version
-docker --version
-docker compose version
+git clone https://github.com/AkGoyal2111/RailBook.git && cd RailBook
+cp .env.prod.example .env    # fill in Gmail, Google OAuth, Razorpay keys
+docker compose -f docker-compose.prod.yml up -d --build
+# Frontend → http://localhost    Gateway → http://localhost:4000
 ```
+
+### Development Mode (infra in Docker, services with npm)
+
+```bash
+# 1. Start infrastructure
+docker compose up -d          # Postgres, Redis, Kafka, Kafka UI, pgAdmin
+
+# 2. Start services (in separate terminals, this order respects Kafka dependencies)
+cd admin-service     && npm install && npx prisma migrate deploy && npm run dev
+cd inventory-service && npm install && npx prisma migrate deploy && npm run dev
+cd user-service      && npm install && npx prisma migrate deploy && npm run dev
+cd payment-service   && npm install && npx prisma migrate deploy && npm run dev
+cd booking-service   && npm install && npx prisma migrate deploy && npm run dev
+cd api-gateway       && npm install && npm run dev
+cd frontend          && npm install && npm run dev   # http://localhost:3000
+```
+
+### Smoke Test
+
+1. Register with email → OTP is sent via Gmail → verify → login
+2. Create station → train → route → schedule (this fires `SCHEDULE_CREATED`, inventory service creates seats)
+3. Search trains for a date → select seats → pay with Razorpay test mode → booking confirms
 
 ---
 
-### Installation
+## Tests
 
-#### 1. Clone the repository
-```bash
-git clone https://github.com/YOUR_USERNAME/irctc-backend.git
-cd irctc-backend
-```
+Unit tests use Node's built-in test runner (`node --test`) — zero external test dependencies.
 
-#### 2. Start the infrastructure stack
-```bash
-docker-compose up -d
-docker ps
-```
-
-This starts **all** infrastructure containers: PostgreSQL, pgAdmin, Redis Stack, Zookeeper, Kafka, Kafka UI, Elasticsearch and Kibana. See the [Port Reference](#-port-reference) for access URLs.
-
-#### 3. Install and configure each service
-For every backend service (`user-service`, `admin-service`, `booking-service`, `payment-service`, `inventory-service`, `search-service`, `notification-service`, `api-gateway`):
+| Service | What's Covered |
+|---------|---------------|
+| `api-gateway` | Circuit breaker state machine (CLOSED → OPEN → HALF_OPEN → CLOSED), threshold behavior, fast-fail |
+| `payment-service` | Razorpay webhook signature verification (security-critical path) |
+| `user-service` | JWT access/refresh token generation & verification, token hashing |
 
 ```bash
-cd <service-name>
-npm install
-cp .env.example .env       # then fill in real secrets
+cd api-gateway && npm test
+cd payment-service && npm test
+cd user-service && npm test
 ```
 
-For the **5 services with Prisma** (`user-service`, `admin-service`, `booking-service`, `payment-service`, `inventory-service`), also run migrations:
-
-```bash
-npx prisma migrate dev --name init
-npx prisma generate
-```
-
-#### 4. Install the frontend
-```bash
-cd frontend
-npm install
-cp .env.example .env
-```
+CI runs all three in parallel via GitHub Actions on every push/PR to `main`. See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ---
 
-### Running the Application
+## API Routes
 
-Open one terminal per service. The recommended startup order respects Kafka consumer dependencies:
+All routes go through the gateway at `http://localhost:4000/api/...`. Direct service access is also possible during development.
 
-```bash
-# 1. Infrastructure
-docker-compose up -d
+### Authentication (User Service)
 
-# 2. Admin service (publishes station/train/route/schedule events)
-cd admin-service && npm run dev
+| Method | Gateway Path | Auth | Rate Limit |
+|--------|-------------|------|------------|
+| POST | `/api/users/auth/send-otp` | — | 5/hour |
+| POST | `/api/users/auth/verify-otp` | — | 10/hour |
+| POST | `/api/users/auth/login` | — | 100/15min |
+| POST | `/api/users/auth/google-auth` | — | 10/15min |
+| POST | `/api/users/auth/refresh` | — | 20/15min |
+| GET | `/api/users/user/profile` | JWT | default |
 
-# 3. Inventory service (consumes admin.schedule-* events)
-cd inventory-service && npm run dev
+### Admin (Station/Train/Route/Schedule CRUD)
 
-# 4. Search service (consumes admin.* and inventory.* events)
-cd search-service && npm run dev
+| Method | Gateway Path | Auth |
+|--------|-------------|------|
+| POST | `/api/admins/stations/station` | JWT |
+| GET | `/api/admins/stations/station` | JWT |
+| POST | `/api/admins/trains/train` | JWT |
+| GET | `/api/admins/trains/train/:trainId` | JWT |
+| POST | `/api/admins/trains/route` | JWT |
+| POST | `/api/admins/schedules/schedule` | JWT |
+| PUT | `/api/admins/schedules/schedule/:scheduleId` | JWT |
 
-# 5. User service
-cd user-service && npm run dev
+### Search (served by Admin Service)
 
-# 6. Payment service
-cd payment-service && npm run dev
+| Method | Gateway Path | Auth | Rate Limit |
+|--------|-------------|------|------------|
+| GET | `/api/search/trains?from=&to=&date=` | — | 60/min |
+| GET | `/api/search/autocomplete?q=` | — | 120/min |
 
-# 7. Booking service (consumes payment.* and admin.schedule-cancelled)
-cd booking-service && npm run dev
+### Bookings
 
-# 8. Notification service (consumes booking.* and notification.* events)
-cd notification-service && npm run dev
+| Method | Gateway Path | Auth | Rate Limit |
+|--------|-------------|------|------------|
+| POST | `/api/bookings/bookings` | JWT | 5/min |
+| GET | `/api/bookings/bookings` | JWT | default |
+| GET | `/api/bookings/bookings/:bookingId` | JWT | default |
+| POST | `/api/bookings/bookings/:bookingId/verify-payment` | JWT | default |
+| POST | `/api/bookings/bookings/:bookingId/cancel` | JWT | default |
 
-# 9. API Gateway
-cd api-gateway && npm run dev
+### Inventory (public read, internal write)
 
-# 10. Frontend
-cd frontend && npm run dev
-```
+| Method | Gateway Path | Auth |
+|--------|-------------|------|
+| GET | `/api/inventory/schedules/:scheduleId/availability` | — |
+| GET | `/api/inventory/schedules/:scheduleId/seats` | JWT |
 
-Frontend will be available at **http://localhost:3000** and proxies API calls to the gateway at **http://localhost:4000**.
+Lock/unlock/confirm/cancel-booking endpoints are internal-only (called by booking-service directly, not exposed through the gateway).
 
----
+### Payments (webhook only through gateway)
 
-## 📦 Services
+| Method | Gateway Path | Auth |
+|--------|-------------|------|
+| POST | `/api/payments/webhooks/razorpay` | Razorpay signature |
 
-All services are implemented (✅). Endpoints below show the **direct** path on each service. Through the API Gateway, prefix everything with `/api/<service-name>` (see each service's "Gateway path" below).
-
-### 1. API Gateway — Port 4000
-Single entrypoint. Routes requests to backend services, enforces JWT, applies per-route rate limits, and trips circuit breakers on downstream failure.
-
-**Notable endpoints:**
+### Gateway Health
 
 | Method | Path | Notes |
-|---|---|---|
-| GET | `/health` | Liveness |
-| GET | `/api/gateway/health` | Aggregate downstream health |
-| GET | `/api/gateway/circuit-breakers` | Inspect breaker state |
-| ANY | `/api/users/*` → user-service | |
-| ANY | `/api/search/*` → search-service | |
-| ANY | `/api/admins/*` → admin-service | |
-| ANY | `/api/bookings/*` → booking-service | |
-| ANY | `/api/payments/*` → payment-service | |
-| ANY | `/api/inventory/*` → inventory-service | |
-
-**Tech:** Express, axios, ioredis, jsonwebtoken, helmet, morgan, winston.
+|--------|------|-------|
+| GET | `/health` | Liveness probe |
+| GET | `/api/gateway/health` | Gateway health |
+| GET | `/api/gateway/circuit-breakers` | Current breaker states |
 
 ---
 
-### 2. User Service — Port 4001
-User registration, OTP verification, JWT issuance + rotation, Google OAuth, profile management.
+## Environment Variables
 
-**Database:** PostgreSQL `user_service_database` (models: `User`, `AuthProvider`)
-**Gateway path:** `/api/users/*`
+Each service has a `.env.example` — copy to `.env` and fill in real values. **Never commit `.env` files.**
 
-| Method | Path | Auth |
-|---|---|---|
-| POST | `/auth/send-otp` | — |
-| POST | `/auth/verify-otp` | — |
-| POST | `/auth/login` | — |
-| POST | `/auth/refresh` | — |
-| POST | `/auth/google-auth` | — |
-| GET | `/user/profile` | JWT |
-| PUT | `/user/profile` | JWT |
-| DELETE | `/user/profile` | JWT |
-| GET | `/user/internal/:userId` | `INTERNAL_SERVICE_KEY` |
-| GET | `/health` | — |
+**Secrets that must match across services:**
+- `JWT_ACCESS_SECRET` and `JWT_REFRESH_SECRET` — shared between API Gateway and User Service
+- `INTERNAL_SERVICE_KEY` — shared across all services for internal REST calls
 
-**Kafka — produces:** `notification.otp-email`, `notification.welcome-email`
+**External integrations you must configure:**
+- Gmail app password (for OTP emails)
+- Google OAuth client ID
+- Razorpay key ID, key secret, and webhook secret
 
----
-
-### 3. Search Service — Port 4002
-Train and station search backed by Elasticsearch. Indexes are kept fresh by consuming admin and inventory events.
-
-**Datastore:** Elasticsearch (no Postgres)
-**Gateway path:** `/api/search/*`
-
-| Method | Path | Notes |
-|---|---|---|
-| GET | `/trains?from=&to=&date=` | Train search |
-| GET | `/autocomplete?q=` | Station autocomplete |
-| GET | `/debug/stations` | Indexed stations (debug) |
-| GET | `/debug/trains` | Indexed trains (debug) |
-
-**Kafka — consumes:** `admin.station-created`, `admin.route-created`, `admin.schedule-created`, `admin.schedule-cancelled`, `inventory.seat-availability-updated`
-**DLQ:** `dlq.search-service`
-
----
-
-### 4. Admin Service — Port 4003
-Source of truth for stations, trains, routes and schedules. Publishes domain events that all read-side services consume.
-
-**Database:** PostgreSQL `admin_service_database` (models: `Station`, `Train`, `Seat`, `Route`, `RouteStation`, `Schedule`)
-**Gateway path:** `/api/admins/*`
-
-| Method | Path | Notes |
-|---|---|---|
-| GET | `/station` | List stations |
-| POST | `/station` | Create station |
-| GET | `/station/:stationId` | Get station |
-| GET | `/station/internal/:stationId` | Internal lookup |
-| GET | `/train` | List trains |
-| POST | `/train` | Create train |
-| GET | `/train/:trainId` | Get train |
-| POST | `/route` | Create route |
-| GET | `/schedule` | List schedules |
-| POST | `/schedule` | Create schedule |
-| PUT | `/schedule/:scheduleId` | Cancel schedule |
-| GET | `/health` | — |
-
-**Kafka — produces:** `admin.station-created`, `admin.train-created`, `admin.route-created`, `admin.schedule-created`, `admin.schedule-cancelled`
-
----
-
-### 5. Notification Service — Port 4004
-Kafka-only consumer (no HTTP API). Sends OTP, welcome and booking emails via SendGrid.
-
-**Kafka — consumes:** `notification.otp-email`, `notification.welcome-email`, `booking.confirmed`, `booking.failed`, `booking.cancelled`
-**DLQ:** `dlq.notification-service`
-
----
-
-### 6. Booking Service — Port 4005
-Orchestrates the booking saga: locks seats in inventory, creates a payment order, waits for payment confirmation via Kafka, then confirms or rolls back.
-
-**Database:** PostgreSQL `booking_service_database` (`Booking` with saga tracking, segment bookings)
-**Gateway path:** `/api/bookings/*`
-
-| Method | Path | Auth |
-|---|---|---|
-| POST | `/bookings` | JWT |
-| GET | `/bookings` | JWT |
-| GET | `/bookings/:bookingId` | JWT |
-| POST | `/bookings/:bookingId/verify-payment` | JWT |
-| POST | `/bookings/:bookingId/cancel` | JWT |
-| GET | `/health` | — |
-
-**Kafka — produces:** `booking.confirmed`, `booking.failed`, `booking.cancelled`
-**Kafka — consumes:** `payment.success`, `payment.failed`, `admin.schedule-cancelled`
-
----
-
-### 7. Payment Service — Port 4006
-Razorpay integration. Creates payment orders, verifies signatures, processes webhooks and refunds.
-
-**Database:** PostgreSQL `payment_service_database` (models: `PaymentOrder`, `Refund`, `PaymentAuditLog`)
-**Gateway path:** `/api/payments/*`
-
-| Method | Path | Auth |
-|---|---|---|
-| POST | `/orders` | `INTERNAL_SERVICE_KEY` |
-| GET | `/orders/:paymentOrderId` | `INTERNAL_SERVICE_KEY` |
-| POST | `/orders/:paymentOrderId/verify` | `INTERNAL_SERVICE_KEY` |
-| POST | `/refunds` | `INTERNAL_SERVICE_KEY` |
-| POST | `/webhooks/razorpay` | Razorpay signature (raw body) |
-| GET | `/health` | — |
-
-**Kafka — produces:** `payment.success`, `payment.failed`
-
----
-
-### 8. Inventory Service — Port 4007
-Tracks per-schedule seat availability and segment locks. Background job expires stale locks every 60s.
-
-**Database:** PostgreSQL `inventory_service_database` (models: `ScheduleInventory`, `SeatInventory`, `RouteStop`, `SeatSegmentLock`, `IdempotencyRecord`)
-**Gateway path:** `/api/inventory/*`
-
-| Method | Path | Auth |
-|---|---|---|
-| GET | `/schedules/:scheduleId/availability` | — |
-| GET | `/schedules/:scheduleId/seats` | JWT or internal |
-| POST | `/seats/lock` | `INTERNAL_SERVICE_KEY` |
-| POST | `/seats/unlock` | `INTERNAL_SERVICE_KEY` |
-| POST | `/seats/confirm` | `INTERNAL_SERVICE_KEY` |
-| POST | `/seats/cancel-booking` | `INTERNAL_SERVICE_KEY` |
-
-**Kafka — consumes:** `admin.schedule-created`, `admin.schedule-cancelled`
-**Kafka — produces:** `inventory.seat-availability-updated`
-**DLQ:** `dlq.inventory-service`
-
----
-
-### 9. Frontend — Port 3000
-React 18 + Vite 6 + Tailwind. Auth state via Zustand, forms via React Hook Form, requests via Axios. The Vite dev server proxies `/api` to the gateway at port 4000.
-
+Generate strong secrets:
 ```bash
-cd frontend
-npm install
-npm run dev      # → http://localhost:3000
-npm run build
-npm run preview
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
+
+See individual `.env.example` files in each service directory for the full list.
 
 ---
 
-## 📡 Kafka Topics
-
-All topic names live in [shared/constants/kafka-topics.js](shared/constants/kafka-topics.js).
-
-| Topic | Producer | Consumer(s) |
-|---|---|---|
-| `notification.otp-email` | user-service | notification-service |
-| `notification.welcome-email` | user-service | notification-service |
-| `admin.station-created` | admin-service | search-service |
-| `admin.train-created` | admin-service | — |
-| `admin.route-created` | admin-service | search-service |
-| `admin.schedule-created` | admin-service | inventory-service, search-service |
-| `admin.schedule-cancelled` | admin-service | inventory-service, search-service, booking-service |
-| `inventory.seat-availability-updated` | inventory-service | search-service |
-| `payment.success` | payment-service | booking-service |
-| `payment.failed` | payment-service | booking-service |
-| `booking.confirmed` | booking-service | notification-service |
-| `booking.failed` | booking-service | notification-service |
-| `booking.cancelled` | booking-service | notification-service |
-| `dlq.<service>` | each consumer on failure | (operator-driven) |
-
-Every consumer is wrapped with [shared/utils/dlqHandler.js](shared/utils/dlqHandler.js), which retries up to 3 times before publishing the failed message to the service's DLQ topic.
-
----
-
-## 📖 API Documentation
-
-You can call the backend two ways:
-
-- **Through the gateway (recommended for clients):** `http://localhost:4000/api/<service>/...`
-- **Directly to a service (for development/testing):** `http://localhost:<service-port>/...`
-
-Examples below show direct user-service calls (port 4001). Through the gateway, the same routes are exposed under `/api/users/auth/...` and `/api/users/user/...`.
-
-### Send OTP
-```http
-POST http://localhost:4001/auth/send-otp
-Content-Type: application/json
-
-{
-  "email": "user@example.com"
-}
-```
-```json
-{
-  "success": true,
-  "message": "OTP sent to email",
-  "data": { "email": "user@example.com" }
-}
-```
-
-### Verify OTP
-```http
-POST http://localhost:4001/auth/verify-otp
-Content-Type: application/json
-
-{
-  "email": "user@example.com",
-  "otp": "123456"
-}
-```
-
-### Login
-```http
-POST http://localhost:4001/auth/login
-Content-Type: application/json
-
-{
-  "email": "user@example.com",
-  "password": "SecurePass123!"
-}
-```
-
-### Refresh access token
-```http
-POST http://localhost:4001/auth/refresh
-Cookie: refreshToken=<refresh-jwt>
-```
-
-### Get profile
-```http
-GET http://localhost:4001/user/profile
-Authorization: Bearer <access-jwt>
-```
-
-### Search trains
-```http
-GET http://localhost:4002/trains?from=NDLS&to=BCT&date=2026-05-01
-```
-
-### Create a booking
-```http
-POST http://localhost:4005/bookings
-Authorization: Bearer <access-jwt>
-Content-Type: application/json
-```
-
-A full OpenAPI / Postman collection will be added in a future update.
-
----
-
-## 🔐 Environment Variables
-
-Each service ships with a `.env.example`. Copy it to `.env` and fill in real values. **Never commit `.env`.**
-
-> Tip — generate a strong secret:
-> ```bash
-> node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-> ```
-
-### API Gateway — [api-gateway/.env.example](api-gateway/.env.example)
-```bash
-PORT=4000
-NODE_ENV=development
-
-ALLOWED_ORIGINS=http://localhost:3000
-REDIS_URL=redis://:irctcpass@localhost:6379
-
-JWT_ACCESS_SECRET=your_access_secret
-JWT_REFRESH_SECRET=your_refresh_secret
-ACCESS_TOKEN_EXP=15m
-REFRESH_TOKEN_EXP=7d
-ACCESS_TOKEN_EXP_SEC=900
-REFRESH_TOKEN_EXP_SEC=604800
-
-RATE_LIMIT_WINDOW_MS=900000
-RATE_LIMIT_MAX_REQUESTS=100
-
-USER_SERVICE_URL=http://localhost:4001
-SEARCH_SERVICE_URL=http://localhost:4002
-BOOKING_SERVICE_URL=http://localhost:4005
-NOTIFICATION_SERVICE_URL=http://localhost:4004
-PAYMENT_SERVICE_URL=http://localhost:4006
-
-SERVICE_TIMEOUT_MS=60000
-CIRCUIT_BREAKER_THRESHOLD=5
-CIRCUIT_BREAKER_TIMEOUT=60000
-```
-
-### User Service — [user-service/.env.example](user-service/.env.example)
-```bash
-PORT=4001
-NODE_ENV=development
-LOG_LEVEL=info
-
-DATABASE_URL=postgres://admin:irctcpass@localhost:5432/user_service_database
-REDIS_URL=redis://:irctcpass@localhost:6379
-KAFKA_BROKER=localhost:9093
-
-ALLOWED_ORIGINS=http://localhost:4000,http://localhost:4001,http://localhost:4005
-
-OTP_TTL=300
-OTP_HMAC_SECRET=your_64_char_hex
-OTP_RATE_MAX_PER_HOUR=5
-OTP_MAX_VERIFY_ATTEMPTS=5
-SENDGRID_API_KEY=SG.your_key
-
-JWT_ACCESS_SECRET=your_64_char_hex
-JWT_REFRESH_SECRET=your_128_char_hex
-ACCESS_TOKEN_EXP=15m
-REFRESH_TOKEN_EXP=7d
-ACCESS_TOKEN_EXP_SEC=900
-REFRESH_TOKEN_EXP_SEC=604800
-REDIS_USER_TTL=86400
-
-INTERNAL_SERVICE_KEY=your_shared_internal_service_key
-```
-
-### Search Service — [search-service/.env.example](search-service/.env.example)
-```bash
-PORT=4002
-NODE_ENV=development
-LOG_LEVEL=info
-
-ELASTICSEARCH_URL=http://localhost:9200
-KAFKA_BROKER=localhost:9093
-KAFKA_CLIENT_ID=search-service
-ALLOWED_ORIGINS=http://localhost:3000,http://localhost:4000,http://localhost:4001
-ES_RECREATE_INDICES=true
-```
-
-### Admin Service — [admin-service/.env.example](admin-service/.env.example)
-```bash
-PORT=4003
-NODE_ENV=development
-LOG_LEVEL=info
-
-DATABASE_URL=postgres://admin:irctcpass@localhost:5432/admin_service_database
-ALLOWED_ORIGINS=http://localhost:3000,http://localhost:4000,http://localhost:4001,http://localhost:4003,http://localhost:4005
-
-KAFKA_BROKER=localhost:9093
-KAFKA_CLIENT_ID=admin-service
-
-INTERNAL_SERVICE_KEY=your_shared_internal_service_key
-```
-
-### Notification Service — [notification-service/.env.example](notification-service/.env.example)
-```bash
-PORT=4004
-NODE_ENV=development
-LOG_LEVEL=info
-
-ALLOWED_ORIGINS=http://localhost:4000,http://localhost:4001,http://localhost:4004
-KAFKA_BROKER=localhost:9093
-KAFKA_CLIENT_ID=notification-service
-
-SENDGRID_API_KEY=SG.your_key
-MAIL_SEND=your_sender_email
-FRONTEND_URL=http://localhost:3000/login
-```
-
-### Booking Service — [booking-service/.env.example](booking-service/.env.example)
-```bash
-PORT=4005
-NODE_ENV=development
-LOG_LEVEL=info
-
-DATABASE_URL=postgres://admin:irctcpass@localhost:5432/booking_service_database
-REDIS_URL=redis://:irctcpass@localhost:6379
-ALLOWED_ORIGINS=http://localhost:3000,http://localhost:4000
-
-KAFKA_BROKER=localhost:9093
-KAFKA_CLIENT_ID=booking-service
-
-INVENTORY_SERVICE_URL=http://localhost:4007
-PAYMENT_SERVICE_URL=http://localhost:4006
-USER_SERVICE_URL=http://localhost:4001
-ADMIN_SERVICE_URL=http://localhost:4003
-INTERNAL_SERVICE_KEY=your_shared_internal_service_key
-
-BOOKING_TTL_SECONDS=600
-BOOKING_EXPIRY_CHECK_INTERVAL_MS=30000
-LOCK_TTL_SECONDS=600
-```
-
-### Payment Service — [payment-service/.env.example](payment-service/.env.example)
-```bash
-PORT=4006
-NODE_ENV=development
-LOG_LEVEL=info
-
-DATABASE_URL=postgres://admin:irctcpass@localhost:5432/payment_service_database
-ALLOWED_ORIGINS=http://localhost:3000,http://localhost:4000
-
-KAFKA_BROKER=localhost:9093
-KAFKA_CLIENT_ID=payment-service
-
-INTERNAL_SERVICE_KEY=your_shared_internal_service_key
-
-PAYMENT_GATEWAY=razorpay
-RAZORPAY_KEY_ID=your_razorpay_key_id
-RAZORPAY_KEY_SECRET=your_razorpay_key_secret
-RAZORPAY_WEBHOOK_SECRET=your_razorpay_webhook_secret
-```
-
-### Inventory Service — [inventory-service/.env.example](inventory-service/.env.example)
-```bash
-PORT=4007
-NODE_ENV=development
-LOG_LEVEL=info
-
-DATABASE_URL=postgres://admin:irctcpass@localhost:5432/inventory_service_database
-ALLOWED_ORIGINS=http://localhost:3000,http://localhost:4000
-
-KAFKA_BROKER=localhost:9093
-KAFKA_CLIENT_ID=inventory-service
-
-LOCK_TTL_SECONDS=300
-LOCK_EXPIRY_INTERVAL_MS=60000
-
-INTERNAL_SERVICE_KEY=your_shared_internal_service_key
-```
-
-### Frontend — [frontend/.env.example](frontend/.env.example)
-```bash
-VITE_API_BASE_URL=/api
-```
-
-**🔒 Security checklist**
-- ❌ Never commit `.env` files.
-- ✅ The same `INTERNAL_SERVICE_KEY` value must be set across all services that talk to each other internally (user, admin, booking, payment, inventory, notification).
-- ✅ Use 32+ byte secrets for JWT and OTP HMAC.
-- ✅ Rotate Razorpay and SendGrid keys on every leak.
-
----
-
-## 📁 Project Structure
+## Project Structure
 
 ```
-irctc-backend/
-├── api-gateway/           # Port 4000 — entry point, JWT, rate-limit, circuit breaker
-├── user-service/          # Port 4001 — auth, OTP, JWT, profile (Postgres + Redis)
-├── search-service/        # Port 4002 — Elasticsearch-backed train/station search
-├── admin-service/         # Port 4003 — stations/trains/routes/schedules CRUD (Postgres)
-├── notification-service/  # Port 4004 — Kafka-only consumer, sends emails via SendGrid
-├── booking-service/       # Port 4005 — booking saga (Postgres + Redis)
-├── payment-service/       # Port 4006 — Razorpay orders/refunds/webhooks (Postgres)
-├── inventory-service/     # Port 4007 — per-schedule seat inventory & locks (Postgres)
-├── frontend/              # Port 3000 — React 18 + Vite 6 + Tailwind
-├── shared/                # Cross-service utilities (see below)
+RailBook/
+├── api-gateway/           # Single entrypoint — JWT, rate limiting, circuit breakers
+├── user-service/          # Auth, OTP, JWT, Google OAuth, profile (Postgres + Redis)
+├── admin-service/         # Stations, trains, routes, schedules, search (Postgres)
+├── booking-service/       # Booking saga orchestrator, expiry daemon (Postgres + Redis)
+├── payment-service/       # Razorpay integration, webhooks, refunds (Postgres)
+├── inventory-service/     # Seat inventory, segment locking, availability (Postgres)
+├── frontend/              # React 18 + Vite 6 + Tailwind CSS
+├── shared/                # Cross-service code
 │   ├── constants/
-│   │   ├── kafka-topics.js     # Single source of truth for Kafka topic names
-│   │   ├── asyncHandler.js     # Express async error wrapper
-│   │   └── error.js            # Error definitions
+│   │   └── kafka-topics.js    # Single source of truth for all Kafka topic names
 │   └── utils/
-│       └── dlqHandler.js       # Kafka consumer wrapper with retry + DLQ publishing
-└── docker-compose.yml     # Postgres, pgAdmin, Redis, Zookeeper, Kafka, Kafka UI, ES, Kibana
+│       └── dlqHandler.js      # Kafka consumer wrapper — retry + DLQ publishing
+├── db/init/               # Postgres init scripts (auto-creates 5 databases)
+├── docker-compose.yml     # Dev infrastructure (Postgres, Redis, Kafka, Kafka UI, pgAdmin)
+├── docker-compose.prod.yml  # Full production stack (infra + all services + frontend)
+└── DEPLOYMENT.md          # Deployment guide (local Docker + Oracle Cloud free tier)
 ```
 
-Each backend service follows the same internal layout:
-
+Each backend service follows:
 ```
 <service>/
 ├── src/
-│   ├── index.js           # Server bootstrap
-│   ├── app.js             # Express app + middleware
-│   ├── config/            # Env + clients (db, redis, kafka)
-│   ├── routes/            # Route definitions
+│   ├── index.js           # Server bootstrap + Kafka consumer init
+│   ├── config/            # Environment config, DB client, Redis client, Kafka client
+│   ├── routes/            # Express route definitions
 │   ├── controllers/       # Request handlers
-│   ├── services/          # Business logic
-│   ├── middlewares/       # Auth, error, validation
+│   ├── services/          # Core business logic
+│   ├── middlewares/       # Auth, validation, error handling
 │   ├── kafka/             # Producers and consumers
-│   └── utils/             # Logger and helpers
-├── prisma/                # Schema + migrations (Prisma services only)
-├── .env.example
-└── package.json
+│   └── utils/             # Logger, error classes, helpers
+├── prisma/                # Schema + migrations (5 services)
+├── __tests__/             # Unit tests (gateway, payment, user)
+├── Dockerfile
+└── .env.example
 ```
+
+---
+
+## Infrastructure Ports
+
+| Component | Port(s) | Access |
+|-----------|---------|--------|
+| PostgreSQL 15 | 5432 | `admin` / `irctcpass` (dev defaults) |
+| pgAdmin | 8081 | `admin@admin.com` / `admin` |
+| Redis Stack | 6379 (Redis), 8001 (RedisInsight) | password `irctcpass` |
+| Kafka | 9092 (internal), 9093 (host) | |
+| Kafka UI | 8080 | topic inspection |
+| Zookeeper | 2181 | |
+
+---
+
+## Deployment
+
+See [`DEPLOYMENT.md`](DEPLOYMENT.md) for detailed instructions covering:
+- **Full Docker deployment** — single `docker compose` command for everything
+- **Oracle Cloud Always Free tier** — self-hosted on a free ARM VM (4 cores, 24 GB RAM)
+- **Optional**: frontend on Vercel, free domain + auto-TLS with Caddy
+
+---
+
+## License
+
+MIT
